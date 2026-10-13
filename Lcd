@@ -1,0 +1,55 @@
+#include <Arduino.h>
+#include <LiquidCrystal.h>
+#include <ESP32SPISlave.h>
+
+
+const int RS = 26;
+const int EN = 2;
+const int D0 = 4;
+const int D1 = 5;
+const int D2 = 18;
+const int D3 = 19;
+const int D4 = 21;  
+const int D5 = 22;
+const int D6 = 23;
+const int D7 = 27;
+const int LED1 = 32;
+const int LED2 = 33;
+const int LED3 = 25;
+
+const int POT_PIN = 34;
+
+const float ADC = 4095.0; 
+const float VREF = 3.3;
+
+LiquidCrystal lcd(RS, EN, D0, D1, D2, D3, D4, D5, D6, D7);
+
+
+char ultimoLED = 'R';
+
+void actualizarLCD(float voltaje, int bits, char led) {
+  lcd.setCursor(0, 0);
+  lcd.print("P1:");
+  lcd.print(voltaje, 2);
+  lcd.print("V B:");
+  lcd.print(bits);
+  lcd.print("   ");
+
+  lcd.setCursor(0, 1);
+  lcd.print("LED: ");
+  lcd.print(led);
+  lcd.print(" ");
+}
+
+void setup() {
+  lcd.begin(16, 2);
+}
+
+void loop() {
+  int lecturaADC = analogRead(POT_PIN);
+  float voltaje = (lecturaADC / ADC) * VREF;
+
+  actualizarLCD(voltaje, lecturaADC, ultimoLED);
+
+  delay(300);
+}
