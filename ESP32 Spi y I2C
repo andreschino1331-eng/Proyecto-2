@@ -1,0 +1,166 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal.h>
+#include <ESP32SPISlave.h>
+
+// Pines LCD (modo 4 bits: solo D4-D7 conectados)
+
+const int RS = 26;
+const int EN = 2;
+const int D4 = 18;
+const int D5 = 19;
+const int D6 = 23;
+const int D7 = 27;
+const int LED1 = 32;
+const int LED2 = 33;
+const int LED3 = 25;
+const int LED_PINS[3] = {LED1, LED2, LED3};
+bool ledEncendido[3] = {false, false, false};
+unsigned long ledApagarEn[3] = {0, 0, 0};
+const int POT_PIN = 36;
+const float ADC_RES = 4095.0;
+const float VREF = 3.3;
+
+const unsigned long ADC_SAMPLE_MS = 20;
+unsigned long ultimoSampleADC = 0;
+volatile uint16_t lecturaPot = 0;   // ultima lectura del ADC (0-4095)
+
+LiquidCrystal lcd(RS, EN, D4, D5, D6, D7);
+
+char ultimoLED = '-';
+
+// SPI esclavo (HSPI: MOSI=13, MISO=12, SCK=14, CS=15)
+// Trama de 3 bytes: [LED][tiempo alto][tiempo bajo]
+
+ESP32SPISlave slave;
+static constexpr size_t SPI_BUF_SIZE = 3;
+static constexpr size_t QUEUE_SIZE = 1;
+uint8_t spi_tx_buf[SPI_BUF_SIZE];
+uint8_t spi_rx_buf[SPI_BUF_SIZE];
+// I2C esclavo (SDA=GPIO21, SCL=GPIO22, direccion 0x55)
+// La Nucleo pide 2 bytes: [valor ADC alto][valor ADC bajo]
+#define I2C_ADDR 0x55
+volatile bool peticionI2C = false;   // para avisar en el loop 
+
+void onRequestI2C() {
+  uint16_t v = lecturaPot;
+  uint8_t buf[2] = { (uint8_t)(v >> 8), (uint8_t)(v & 0xFF) };
+  Wire.write(buf, 2);
+  peticionI2C = true;
+}
+
+// Refresco del LCD sin bloquear
+const unsigned long LCD_REFRESH_MS = 200;
+unsigned long ultimoRefreshLCD = 0;
+
+void actualizarLCD(float voltaje, int bits, char led) {
+  lcd.setCursor(0, 0);
+  lcd.print("P1:");
+  lcd.print(voltaje, 2);
+  lcd.print("V B:");
+  lcd.print(bits);
+  lcd.print("   ");
+
+  lcd.setCursor(0, 1);
+  lcd.print("LED: ");
+  lcd.print(led);
+  lcd.print(" ");
+}
+
+// Enciende el LED y programa cuando apagarlo (no bloquea)
+void encenderLED(uint8_t numeroLED, uint16_t tiempoMs) {
+  if (numeroLED < 1 || numeroLED > 3) return; // comando invalido, se ignora
+
+  int i = numeroLED - 1;
+  digitalWrite(LED_PINS[i], HIGH);
+  ledEncendido[i] = true;
+  ledApagarEn[i] = millis() + tiempoMs;
+  ultimoLED = '0' + numeroLED;  // '1', '2' o '3'
+}
+
+// Apaga los LEDs cuyo tiempo ya se cumplio
+void actualizarLEDs() {
+  for (int i = 0; i < 3; i++) {
+    if (ledEncendido[i] && (long)(millis() - ledApagarEn[i]) >= 0) {
+      digitalWrite(LED_PINS[i], LOW);
+      ledEncendido[i] = false;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  lcd.begin(16, 2);
+
+  for (int i = 0; i < 3; i++) {
+    pinMode(LED_PINS[i], OUTPUT);
+    digitalWrite(LED_PINS[i], LOW);
+  }
+
+  // Primera lectura para que el I2C no responda 0 si la Nucleo pide muy rapido
+  lecturaPot = analogRead(POT_PIN);
+
+  // --- SPI esclavo ---
+  memset(spi_tx_buf, 0, SPI_BUF_SIZE);
+  memset(spi_rx_buf, 0, SPI_BUF_SIZE);
+  slave.setDataMode(SPI_MODE0);
+  slave.setQueueSize(QUEUE_SIZE);
+  slave.begin(HSPI); // MOSI=13, MISO=12, SCK=14, CS=15
+
+  // --- I2C esclavo (pines por defecto: SDA=21, SCL=22) ---
+  Wire.onRequest(onRequestI2C);
+  Wire.begin((uint8_t)I2C_ADDR);
+}
+
+void loop() {
+  // 1) Si no hay transaccion SPI en curso, se arma una nueva
+  if (slave.hasTransactionsCompletedAndAllResultsHandled()) {
+    memset(spi_rx_buf, 0, SPI_BUF_SIZE);
+    slave.queue(spi_tx_buf, spi_rx_buf, SPI_BUF_SIZE);
+    slave.trigger();
+  }
+
+  // 2) Si la Nucleo completo una transaccion SPI, se procesa
+  if (slave.hasTransactionsCompletedAndAllResultsReady(QUEUE_SIZE)) {
+    const std::vector<size_t> recibidos = slave.numBytesReceivedAll();
+
+    if (!recibidos.empty() && recibidos[0] >= 3) {
+      uint8_t numeroLED = spi_rx_buf[0];
+      uint16_t tiempoMs = ((uint16_t)spi_rx_buf[1] << 8) | spi_rx_buf[2];
+
+      Serial.print("SPI recibido -> LED: ");
+      Serial.print(numeroLED);
+      Serial.print(" | Tiempo: ");
+      Serial.print(tiempoMs);
+      Serial.println(" ms");
+
+      encenderLED(numeroLED, tiempoMs);
+    }
+  }
+
+  // 3) Apagar LEDs que ya cumplieron su tiempo
+  actualizarLEDs();
+
+  // 4) Muestrear el ADC 
+  if (millis() - ultimoSampleADC >= ADC_SAMPLE_MS) {
+    ultimoSampleADC = millis();
+    lecturaPot = analogRead(POT_PIN);
+  }
+
+  // 5) Avisar por Serial cuando la Nucleo pidio una medicion
+  if (peticionI2C) {
+    peticionI2C = false;
+    Serial.print("I2C -> medicion enviada: ");
+    Serial.println(lecturaPot);
+  }
+
+  // 6) Refrescar LCD cada 200 ms
+  if (millis() - ultimoRefreshLCD >= LCD_REFRESH_MS) {
+    ultimoRefreshLCD = millis();
+
+    uint16_t lectura = lecturaPot;
+    float voltaje = (lectura / ADC_RES) * VREF;
+    actualizarLCD(voltaje, lectura, ultimoLED);
+  }
+}
